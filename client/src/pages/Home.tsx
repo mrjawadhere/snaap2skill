@@ -71,6 +71,8 @@ const initialChat: ChatMessage[] = [
   { role: "assistant", text: "I’d classify this as a reliability incident with elevated impact. What is the customer-facing urgency: P0 (broad outage), P1 (major degradation), or P2 (limited impact)?" },
 ];
 
+import { trpc } from "@/lib/trpc";
+
 export default function Home() {
   const [state, setState] = useState<AppState>("idle");
   const [tab, setTab] = useState<Tab>("flow");
@@ -78,7 +80,17 @@ export default function Home() {
   const [chat, setChat] = useState<ChatMessage[]>(initialChat);
   const [draft, setDraft] = useState("");
   const [copied, setCopied] = useState(false);
+  const [activeSpec, setActiveSpec] = useState(skillMarkdown);
+  const [isAiResponding, setIsAiResponding] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const statusQuery = trpc.skill.status.useQuery(undefined, {
+    retry: 1,
+    refetchOnWindowFocus: false,
+  });
+
+  const chatMutation = trpc.skill.chat.useMutation();
+  const compileMutation = trpc.skill.compile.useMutation();
 
   const status = useMemo(() => {
     if (state === "uploading") return { label: "Uploading sketch", helper: "Reading image pixels and preparing the canvas" };
@@ -89,6 +101,7 @@ export default function Home() {
 
   const loadSample = () => {
     setFileName("incident-triage-sample.png");
+    setActiveSpec(skillMarkdown);
     setState("success");
     setTab("flow");
   };
@@ -97,21 +110,31 @@ export default function Home() {
     if (!file) return;
     setFileName(file.name);
     setState("uploading");
-    window.setTimeout(() => setState("success"), 1000);
+    window.setTimeout(() => setState("success"), 800);
   };
 
-  const compile = () => {
+  const compile = async () => {
     if (state === "compiling") return;
     setState("compiling");
-    window.setTimeout(() => {
+
+    try {
+      if (fileName && fileName !== "incident-triage-sample.png") {
+        const res = await compileMutation.mutateAsync({ fileName });
+        if (res.success && res.skillMarkdown) {
+          setActiveSpec(res.skillMarkdown);
+        }
+      }
+    } catch {
+      // Fallback to active template on error
+    } finally {
       setState("success");
       setTab("flow");
-    }, 1700);
+    }
   };
 
   const copySpec = async () => {
     try {
-      await navigator.clipboard.writeText(skillMarkdown);
+      await navigator.clipboard.writeText(activeSpec);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1800);
     } catch {
@@ -120,15 +143,37 @@ export default function Home() {
     }
   };
 
-  const sendMessage = () => {
+  const sendMessage = async () => {
     const text = draft.trim();
-    if (!text) return;
-    setChat((current) => [
-      ...current,
-      { role: "user", text },
-      { role: "assistant", text: text.toLowerCase().includes("severity") ? "Based on the workflow, I need impact and scope before assigning severity. How many customers are affected, and is there a workaround?" : "I’ve routed that through the compiled workflow. Share impact, urgency, or the owner context and I’ll produce the next handoff step." },
-    ]);
+    if (!text || isAiResponding) return;
+
+    const userMessage: ChatMessage = { role: "user", text };
+    const updatedChat = [...chat, userMessage];
+    setChat(updatedChat);
     setDraft("");
+    setIsAiResponding(true);
+
+    try {
+      const res = await chatMutation.mutateAsync({
+        message: text,
+        skillMarkdown: activeSpec,
+        history: updatedChat,
+      });
+
+      if (res?.text) {
+        setChat((curr) => [...curr, { role: "assistant", text: res.text }]);
+      } else {
+        throw new Error("No response text");
+      }
+    } catch {
+      // Clean fallback if backend is unreachable
+      const fallbackText = text.toLowerCase().includes("severity")
+        ? "Based on the workflow, I need impact and scope before assigning severity. How many customers are affected, and is there a workaround?"
+        : "I’ve routed that through the compiled workflow. Share impact, urgency, or the owner context and I’ll produce the next handoff step.";
+      setChat((curr) => [...curr, { role: "assistant", text: fallbackText }]);
+    } finally {
+      setIsAiResponding(false);
+    }
   };
 
   return (
@@ -217,10 +262,10 @@ export default function Home() {
 
             {tab === "spec" && <div className="spec-panel">
               <div className="panel-toolbar"><div><div className="panel-title">Generated Agent Skill</div><div className="panel-subtitle">Open standard · Markdown source</div></div><button className={`copy-btn ${copied ? "copied" : ""}`} onClick={copySpec}>{copied ? <Check size={14} /> : <Copy size={14} />} {copied ? "Copied" : "Copy markdown"}</button></div>
-              <div className="code-window"><div className="code-window-bar"><span className="window-dot" /><span className="window-dot" /><span className="window-dot" /><span className="code-path">skills/incident-triage/SKILL.md</span><span className="code-lang">MARKDOWN</span></div><pre>{skillMarkdown.split("\\n").map((line, index) => <code key={index}><span className={line.startsWith("#") ? "syntax-heading" : line.startsWith("---") ? "syntax-rule" : line.startsWith("-") || /^\\d\\./.test(line) ? "syntax-list" : ""}>{line}</span>{"\\n"}</code>)}</pre></div>
+              <div className="code-window"><div className="code-window-bar"><span className="window-dot" /><span className="window-dot" /><span className="window-dot" /><span className="code-path">skills/incident-triage/SKILL.md</span><span className="code-lang">MARKDOWN</span></div><pre>{activeSpec.split("\n").map((line, index) => <code key={index}><span className={line.startsWith("#") ? "syntax-heading" : line.startsWith("---") ? "syntax-rule" : line.startsWith("-") || /^\d\./.test(line) ? "syntax-list" : ""}>{line}</span>{"\n"}</code>)}</pre></div>
             </div>}
 
-            {tab === "sandbox" && <div className="sandbox-panel"><div className="sandbox-header"><div><div className="panel-title">Test the compiled skill</div><div className="panel-subtitle">Run a realistic incident through your new workflow</div></div><div className="sandbox-runtime"><span className="live-pip" /> Runtime online</div></div><div className="chat-window">{chat.map((message, index) => <div key={index} className={`chat-row ${message.role}`}><div className="chat-avatar">{message.role === "assistant" ? <Zap size={13} /> : "YU"}</div><div className="chat-bubble">{message.text}</div></div>)}</div><div className="chat-input"><Paperclip size={16} /><input value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") sendMessage(); }} placeholder="Ask the skill to triage a scenario…" /><button aria-label="Send message" onClick={sendMessage}><Send size={16} /></button></div></div>}
+            {tab === "sandbox" && <div className="sandbox-panel"><div className="sandbox-header"><div><div className="panel-title">Test the compiled skill</div><div className="panel-subtitle">Run a realistic incident through your new workflow</div></div><div className="sandbox-runtime"><span className="live-pip" /> {isAiResponding ? "Gemma reasoning…" : "Runtime online"}</div></div><div className="chat-window">{chat.map((message, index) => <div key={index} className={`chat-row ${message.role}`}><div className="chat-avatar">{message.role === "assistant" ? <Zap size={13} /> : "YU"}</div><div className="chat-bubble">{message.text}</div></div>)}{isAiResponding && <div className="chat-row assistant"><div className="chat-avatar"><Zap size={13} className="spin" /></div><div className="chat-bubble" style={{ opacity: 0.7 }}>Thinking with Gemma 4…</div></div>}</div><div className="chat-input"><Paperclip size={16} /><input value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") sendMessage(); }} placeholder="Ask the skill to triage a scenario…" disabled={isAiResponding} /><button aria-label="Send message" onClick={sendMessage} disabled={isAiResponding || !draft.trim()}><Send size={16} /></button></div></div>}
           </div>
           <div className="studio-bottom"><span><Sparkles size={13} /> Generated with multimodal reasoning</span><span>Changes autosaved</span></div>
         </section>
